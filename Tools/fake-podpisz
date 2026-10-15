@@ -1,0 +1,277 @@
+#!/bin/sh
+"exec" "${PODPIS_PYTHON:-$HOME/.local/share/podpis/venv/bin/python}" "-I" "$0" "$@"
+"""fake-podpisz: the podpisz CLI contract without the card, for developing Podpis.app.
+
+Run the app with PODPIS_CLI pointing here. Nothing touches the card and no real PIN
+is ever used: the fake PIN lives in the state file (default 1234).
+
+  status, pdf, xml   simulated from $FAKE_PODPIS_DIR/state.json (see DEFAULT_STATE)
+  miejsce, grafika   the real podpisz.py (they need no card), unless the state forces an error
+  sprawdz            the real podpisz.py for PDF, a canned answer for the fake XML signature
+
+PDFs are signed for real with pyHanko and a self-signed test key, with the real stamp
+art, so the preview and the verification badge show what the card would produce.
+Every call is appended to log.jsonl (argv and the PIN length, never the PIN).
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+
+REAL_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cli"))
+REAL = os.path.join(REAL_DIR, "podpisz.py")
+DIR = os.environ.get("FAKE_PODPIS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".fake")
+STATE = os.path.join(DIR, "state.json")
+NS_DS = "http://www.w3.org/2000/09/xmldsig#"
+
+DEFAULT_STATE = {
+    "karta": "ok",          # ok | brak_czytnika | brak_karty | brak_sterownika | wyjatek | nie_json | zawieszony
+    "proby": 3,             # PIN tries left: 2 = malo_prob, 1 = ostatnia_proba, 0 = pin_zablokowany
+    "pin": "1234",          # the fake card's PIN
+    "imie_nazwisko": "Jan Kowalski",
+    "wazny_do": "2028-03-12",
+    "kwalifikowany": True,
+    "opoznienie": 1.2,      # seconds per signed file
+    "blad_pdf": None,       # null | "pieczec" | "wyjatek" | "nie_json"
+    "blad_miejsca": None,   # null | "brak_miejsca" | "brak_kotwicy"
+}
+
+
+class Blad(Exception):
+    def __init__(self, kod, tekst, code=2):
+        super().__init__(tekst)
+        self.kod, self.tekst, self.code = kod, tekst, code
+
+
+def state():
+    s = dict(DEFAULT_STATE)
+    try:
+        with open(STATE) as f:
+            s.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    return s
+
+
+def save_state(s):
+    os.makedirs(DIR, exist_ok=True)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(s, f, indent=2, ensure_ascii=False)
+    os.replace(STATE + ".tmp", STATE)
+
+
+def log(entry):
+    os.makedirs(DIR, exist_ok=True)
+    with open(os.path.join(DIR, "log.jsonl"), "a") as f:
+        f.write(json.dumps({"t": time.time(), **entry}, ensure_ascii=False) + "\n")
+
+
+def card(s):
+    k = s["karta"]
+    if k == "zawieszony":
+        time.sleep(3600)
+    if k == "nie_json":
+        print("Traceback (most recent call last):\n  RuntimeError: driver crashed", file=sys.stderr)
+        sys.exit(3)
+    if k == "wyjatek":
+        raise Blad("wyjatek", "PKCS11Error: CKR_DEVICE_ERROR", 3)
+    if k == "brak_sterownika":
+        raise Blad("brak_sterownika", "Brak sterownika karty: libPKCS11Graphite.dylib")
+    if k == "brak_czytnika":
+        raise Blad("brak_czytnika", "Nie widzę czytnika. Podłącz czytnik i spróbuj ponownie.")
+    if k == "brak_karty":
+        raise Blad("brak_karty", "Czytnik jest, ale nie widzę karty kwalifikowanej. Włóż kartę.")
+    if s["proby"] <= 0:
+        raise Blad("pin_zablokowany", "PIN karty jest zablokowany. Odblokuj go PUK-iem w aplikacji KIR.")
+    return {"ostatnia_proba": s["proby"] == 1, "malo_prob": s["proby"] == 2}
+
+
+def cert_info(s):
+    return {"imie_nazwisko": s["imie_nazwisko"], "tytul": "Prezes Zarządu", "pesel": "00000000000",
+            "wystawca": "TEST Szafir Kwalifikowany 2 (fake)", "wazny_do": s["wazny_do"],
+            "kwalifikowany": s["kwalifikowany"]}
+
+
+def check_pin(args, s):
+    flags = card(s)
+    if flags["ostatnia_proba"] and not args.wymus:
+        raise Blad("ostatnia_proba", "Karta ma ostatnią próbę PIN-u. Nie zgaduję; użyj --wymus, gdy PIN jest pewny.")
+    if not args.pin_stdin:
+        raise Blad("anulowano", "fake-podpisz przyjmuje PIN tylko z --pin-stdin.")
+    pin = sys.stdin.readline().strip()
+    log({"cmd": "pin", "pin_len": len(pin)})
+    if not re.fullmatch(r"\d{4,12}", pin):
+        raise Blad("zly_format_pin", "PIN ma mieć same cyfry (4 do 12).")
+    if pin != s["pin"]:
+        s["proby"] -= 1
+        save_state(s)
+        if s["proby"] <= 0:
+            raise Blad("pin_zablokowany", "PIN zablokowany.")
+        raise Blad("zly_pin", "Zły PIN. Nie próbuję ponownie.")
+    s["proby"] = 3
+    save_state(s)
+
+
+def real(argv):
+    r = subprocess.run([sys.executable, "-I", REAL] + argv, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    sys.exit(r.returncode)
+
+
+def test_signer():
+    from pyhanko.sign import signers
+    key, crt = os.path.join(DIR, "test-key.pem"), os.path.join(DIR, "test-cert.pem")
+    if not os.path.exists(crt):
+        os.makedirs(DIR, exist_ok=True)
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+                        "-subj", "/C=PL/CN=Jan Kowalski (TEST)", "-keyout", key, "-out", crt],
+                       check=True, capture_output=True)
+    return signers.SimpleSigner.load(key, crt), crt
+
+
+def cmd_pdf(args, s):
+    check_pin(args, s)
+    if args.out and len(args.plik) > 1:
+        raise Blad("out_paczka", "--out działa tylko dla jednego pliku.")
+    sys.path.insert(0, REAL_DIR)
+    import podpisz as P
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.pdf_utils.layout import AxisAlignment, InnerScaling, Margins, SimpleBoxLayoutRule
+    from pyhanko.sign import fields, signers
+    from pyhanko.stamp import StaticStampStyle
+    signer, _ = test_signer()
+    wyniki = []
+    for plik in args.plik:
+        time.sleep(s["opoznienie"])
+        if s["blad_pdf"] == "nie_json":
+            print("Segmentation fault", file=sys.stderr)
+            sys.exit(139)
+        if s["blad_pdf"] == "pieczec":
+            raise Blad("pieczec", "Nie udało się narysować podpisu: Chrome exited with code 1")
+        if s["blad_pdf"] == "wyjatek":
+            raise Blad("wyjatek", "PdfReadError: Illegal character in Name Object", 3)
+        seal = P._wants_seal(args)
+        if args.nad:
+            pl = P._place(plik, args.nad, args.strona, P.STAMP_W_SEAL if seal else P.STAMP_W)
+            page, rect = pl["strona"], pl["rect"]
+        elif args.strona and args.rect:
+            page, rect = args.strona, args.rect
+        else:
+            raise Blad("brak_miejsca", "Podaj --nad TEKST albo --strona N --rect x1 y1 x2 y2.")
+        out = args.out or re.sub(r"\.pdf$", "", plik, flags=re.I) + "-podpisany.pdf"
+        x1, y1, x2, y2 = [int(round(v)) for v in rect]
+        art = os.path.join(tempfile.mkdtemp(prefix="podpis-fake-"), "pieczec.pdf")
+        P._stamp_pdf(art, datetime.now().strftime("%d.%m.%Y, %H:%M"), x2 - x1, y2 - y1, seal, s["imie_nazwisko"])
+        stamp = StaticStampStyle.from_pdf_file(
+            art, border_width=0,
+            background_layout=SimpleBoxLayoutRule(
+                x_align=AxisAlignment.ALIGN_MID, y_align=AxisAlignment.ALIGN_MID,
+                margins=Margins(0, 0, 0, 0), inner_content_scaling=InnerScaling.STRETCH_FILL))
+        field = f"Podpis_TEST_{datetime.now():%Y%m%d%H%M%S}"
+        meta = signers.PdfSignatureMetadata(field_name=field, md_algorithm="sha256",
+                                            subfilter=fields.SigSeedSubFilter.PADES, name=s["imie_nazwisko"])
+        with open(plik, "rb") as inf:
+            w = IncrementalPdfFileWriter(inf, strict=False)
+            fields.append_signature_field(w, fields.SigFieldSpec(sig_field_name=field, on_page=page - 1,
+                                                                 box=(x1, y1, x2, y2)))
+            with open(out + ".tmp", "wb") as outf:
+                signers.PdfSigner(meta, signer=signer, stamp_style=stamp).sign_pdf(w, output=outf)
+        os.replace(out + ".tmp", out)
+        orig, signed = open(plik, "rb").read(), open(out, "rb").read()
+        wyniki.append({"ok": True, "plik": out, "strona": page, "rect": rect,
+                       "oryginal_jest_prefiksem": signed.startswith(orig),
+                       "podpisal": s["imie_nazwisko"], "sha256": hashlib.sha256(signed).hexdigest()})
+    return {"ok": True, "pliki": wyniki}
+
+
+def cmd_xml(args, s):
+    with open(args.plik, encoding="utf-8") as f:
+        text = f.read()
+    if NS_DS in text and "Signature" in text and not args.kolejny:
+        raise Blad("juz_podpisany", "Plik ma już podpis XML. Dodaj --kolejny, żeby dołożyć następny.")
+    check_pin(args, s)
+    time.sleep(s["opoznienie"])
+    _, crt = test_signer()
+    der = subprocess.run(["openssl", "x509", "-in", crt, "-outform", "DER"], capture_output=True, check=True).stdout
+    sig = (f'<ds:Signature xmlns:ds="{NS_DS}" Id="Sig-fake"><ds:SignatureValue>RkFLRQ==</ds:SignatureValue>'
+           f'<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{base64.b64encode(der).decode()}'
+           f'</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>')
+    body = re.sub(r"(</[^>]+>)\s*$", sig + r"\1", text.rstrip(), count=1)
+    out = args.out or re.sub(r"\.xml$", "", args.plik, flags=re.I) + "-podpisany.xml"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(body)
+    return {"ok": True, "plik": out, "podpisal": s["imie_nazwisko"],
+            "sha256": hashlib.sha256(body.encode()).hexdigest(), "weryfikacja": {"ok": True, "xmlsec1": ["OK"]}}
+
+
+def main():
+    argv = sys.argv[1:]
+    log({"cmd": "argv", "argv": argv})
+    s = state()
+    p = argparse.ArgumentParser(prog="fake-podpisz")
+    p.add_argument("--json", action="store_true")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    sign = argparse.ArgumentParser(add_help=False)
+    sign.add_argument("--pin-stdin", action="store_true")
+    sign.add_argument("--wymus", action="store_true")
+    sign.add_argument("--out")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", parents=[common])
+    m = sub.add_parser("miejsce", parents=[common])
+    m.add_argument("plik"); m.add_argument("--nad", required=True); m.add_argument("--strona", type=int)
+    m.add_argument("--pieczec")
+    pp = sub.add_parser("pdf", parents=[common, sign])
+    pp.add_argument("plik", nargs="+"); pp.add_argument("--nad"); pp.add_argument("--strona", type=int)
+    pp.add_argument("--rect", type=float, nargs=4)
+    pp.add_argument("--pieczec", choices=["tak", "nie"], default="nie")
+    px = sub.add_parser("xml", parents=[common, sign])
+    px.add_argument("plik"); px.add_argument("--kolejny", action="store_true")
+    sub.add_parser("grafika", parents=[common]).add_argument("rest", nargs="*")
+    ps = sub.add_parser("sprawdz", parents=[common])
+    ps.add_argument("plik")
+    a, _ = p.parse_known_args(argv)
+    try:
+        if a.cmd == "status":
+            time.sleep(0.3)
+            flags = card(s)
+            res = {"ok": True, "token": "PKI Token 2 (QSCD)", "numer_karty": "FAKE0001",
+                   "pin": flags, "certyfikat": cert_info(s)}
+        elif a.cmd == "miejsce":
+            if s["blad_miejsca"] == "brak_miejsca":
+                raise Blad("brak_miejsca", f"Nad „{a.nad}” jest tylko 9 pt miejsca na podpis.")
+            if s["blad_miejsca"] == "brak_kotwicy":
+                raise Blad("brak_kotwicy", f"Nie znalazłem tekstu „{a.nad}” w PDF.")
+            real(argv)
+        elif a.cmd == "grafika":
+            real(argv)
+        elif a.cmd == "sprawdz":
+            if a.plik.lower().endswith(".xml"):
+                text = open(a.plik, encoding="utf-8").read()
+                res = {"ok": True, "xml": {"ok": "Sig-fake" in text, "xmlsec1": ["OK" if "Sig-fake" in text else "FAIL"]}}
+            else:
+                real(argv)
+        elif a.cmd == "pdf":
+            res = cmd_pdf(a, s)
+        elif a.cmd == "xml":
+            res = cmd_xml(a, s)
+        code = 0 if res.get("ok") else 1
+    except Blad as e:
+        res, code = {"ok": False, "kod": e.kod, "blad": e.tekst}, e.code
+    except Exception as e:
+        res, code = {"ok": False, "kod": "wyjatek", "blad": f"{type(e).__name__}: {e}"}, 3
+    print(json.dumps(res, ensure_ascii=False))
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

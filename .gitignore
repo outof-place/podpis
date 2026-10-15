@@ -1,0 +1,8 @@
+.build/
+build/
+Tools/.fake/
+*.xcodeproj
+.DS_Store
+.swiftpm/
+__pycache__/
+*.pyc

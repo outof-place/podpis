@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Builds the sample documents in Tests/Fixtures (made-up content, no real data).
+
+Chrome prints the HTML to PDF; pypdf derives the rotated and offset variants that
+the geometry tests need. Run it again only when a fixture has to change.
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Tests", "Fixtures")
+
+STYLE = """<style>
+@page { size: A4; margin: 22mm 20mm }
+body { font: 11pt/1.55 Georgia, serif; color: #111 }
+h1 { font: 600 15pt/1.3 "Helvetica Neue", Arial, sans-serif; text-align: center; margin: 0 0 4mm }
+.sub { text-align: center; color: #444; margin-bottom: 9mm }
+p { margin: 0 0 3.2mm; text-align: justify }
+.sig { display: flex; justify-content: space-between; margin-top: 30mm }
+.sig div { width: 70mm; text-align: center; font-size: 10.5pt }
+.line { border-top: 0.6pt dotted #333; padding-top: 1.5mm }
+.tight { margin-top: 2mm }
+.brk { break-before: page }
+</style>"""
+
+LOREM = [
+    "Strony zgodnie postanawiają, że Wykonawca przygotuje i wdroży system zgodnie z harmonogramem stanowiącym załącznik nr 1.",
+    "Wynagrodzenie płatne jest w terminie 14 dni od dnia doręczenia prawidłowo wystawionej faktury na rachunek wskazany przez Wykonawcę.",
+    "Każda ze Stron zobowiązuje się do zachowania w tajemnicy informacji uzyskanych w związku z wykonywaniem Umowy.",
+    "Zmiany Umowy wymagają formy pisemnej albo elektronicznej z kwalifikowanym podpisem elektronicznym pod rygorem nieważności.",
+    "W sprawach nieuregulowanych Umową zastosowanie mają przepisy Kodeksu cywilnego.",
+]
+
+
+def paragraphs(n, start=1):
+    return "".join(f"<p>§ {i}. {LOREM[(i - 1) % len(LOREM)]} {LOREM[i % len(LOREM)]}</p>"
+                   for i in range(start, start + n))
+
+
+SIG_BLOCK = """<div class="sig">
+<div><div class="line">Jan Kowalski</div>Zamawiający</div>
+<div><div class="line">Jan Kowalski</div>Wykonawca, Prezes Zarządu</div>
+</div>"""
+
+DOCS = {
+    "umowa-wspolpracy.pdf": f"""<h1>UMOWA O WSPÓŁPRACY nr 7/2026</h1>
+<div class="sub">zawarta w Łomży dnia 15 października 2026 r.</div>
+{paragraphs(9)}<div class="brk"></div>{paragraphs(5, 10)}{SIG_BLOCK}""",
+    "uchwala-zarzadu.pdf": f"""<h1>UCHWAŁA ZARZĄDU nr 3/2026</h1>
+<div class="sub">z dnia 15 października 2026 r. w sprawie przyjęcia regulaminu pracy zdalnej</div>
+{paragraphs(4)}<div class="sig" style="justify-content:flex-end"><div><div class="line">Jan Kowalski</div>Prezes Zarządu</div></div>""",
+    "oswiadczenie.pdf": f"""<h1>OŚWIADCZENIE</h1><div class="sub">o zachowaniu poufności</div>
+{paragraphs(3)}<div class="sig" style="justify-content:flex-end"><div><div class="line">podpis</div></div></div>""",
+    "protokol-ciasno.pdf": f"""<h1>PROTOKÓŁ ODBIORU</h1><div class="sub">etap 2</div>
+{paragraphs(3)}<p style="text-align:right">Odbiór potwierdzam bez zastrzeżeń.</p>
+<p class="tight" style="text-align:right">Jan Kowalski</p>""",
+}
+
+XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Deklaracja xmlns="http://example.com/deklaracja/2026">
+  <Naglowek>
+    <KodFormularza>ZGL-1</KodFormularza>
+    <DataWypelnienia>2026-10-15</DataWypelnienia>
+  </Naglowek>
+  <Podmiot>
+    <Nazwa>PRZYKŁADOWA SPÓŁKA SP. Z O.O.</Nazwa>
+    <Miejscowosc>Warszawa</Miejscowosc>
+    <Reprezentant rola="Prezes Zarządu">Jan Kowalski</Reprezentant>
+  </Podmiot>
+  <Tresc>Zgłoszenie zmiany danych kontaktowych spółki.</Tresc>
+</Deklaracja>
+"""
+
+
+def html_to_pdf(html, out):
+    with tempfile.TemporaryDirectory() as td:
+        page = os.path.join(td, "d.html")
+        with open(page, "w") as f:
+            f.write(f'<!doctype html><html lang="pl"><head><meta charset="utf-8">{STYLE}</head><body>{html}</body></html>')
+        subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--no-first-run", f"--user-data-dir={td}/p",
+                        "--no-pdf-header-footer", f"--print-to-pdf={out}", "file://" + page],
+                       check=True, capture_output=True)
+
+
+def variants():
+    """Rotated pages and a media box that does not start at 0,0, for the geometry tests."""
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import RectangleObject
+    src = os.path.join(OUT, "uchwala-zarzadu.pdf")
+    for rot in (90, 180, 270):
+        w = PdfWriter()
+        w.append(PdfReader(src))
+        page = w.pages[0]
+        mb = page.mediabox
+        page.mediabox = RectangleObject([float(mb.left) + 30, float(mb.bottom) + 40, float(mb.right) + 30, float(mb.top) + 40])
+        # shift the content with the box so the page still shows the same thing
+        page.add_transformation((1, 0, 0, 1, 30, 40))
+        page.rotation = rot
+        with open(os.path.join(OUT, f"uchwala-obrot-{rot}.pdf"), "wb") as f:
+            w.write(f)
+
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    for name, html in DOCS.items():
+        html_to_pdf(html, os.path.join(OUT, name))
+    with open(os.path.join(OUT, "zgloszenie.xml"), "w", encoding="utf-8") as f:
+        f.write(XML)
+    variants()
+    print("\n".join(sorted(os.listdir(OUT))))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Deklaracja xmlns="http://example.com/deklaracja/2026">
+  <Naglowek>
+    <KodFormularza>ZGL-1</KodFormularza>
+    <DataWypelnienia>2026-10-15</DataWypelnienia>
+  </Naglowek>
+  <Podmiot>
+    <Nazwa>PRZYKŁADOWA SPÓŁKA SP. Z O.O.</Nazwa>
+    <Miejscowosc>Warszawa</Miejscowosc>
+    <Reprezentant rola="Prezes Zarządu">Jan Kowalski</Reprezentant>
+  </Podmiot>
+  <Tresc>Zgłoszenie zmiany danych kontaktowych spółki.</Tresc>
+</Deklaracja>
