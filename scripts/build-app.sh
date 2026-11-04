@@ -1,13 +1,17 @@
 #!/bin/bash
-# Builds Podpis.app (release, arm64), signs it ad hoc and installs it in ~/Applications.
+# Builds Podpis.app (release, arm64), signs it ad hoc and installs it in /Applications.
 #   scripts/build-app.sh            build and install
 #   scripts/build-app.sh --no-install   only build/Podpis.app
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode-26.6.app/Contents/Developer}
+[ -d "$DEVELOPER_DIR" ] || unset DEVELOPER_DIR   # no pinned Xcode here: the one xcode-select points to
 
 APP=build/Podpis.app
-DEST="$HOME/Applications/Podpis.app"
+# /Applications, where Finder and Launchpad list apps; ~/Applications only when it is not writable
+APPS=/Applications
+[ -w "$APPS" ] || APPS="$HOME/Applications"
+DEST="$APPS/Podpis.app"
 
 swift build -c release --arch arm64 --product Podpis
 BIN=$(swift build -c release --arch arm64 --show-bin-path)/Podpis
@@ -32,7 +36,7 @@ codesign --force --sign - --identifier pl.outofplace.podpis --timestamp=none "$A
 codesign --verify --strict "$APP"
 
 if [ "${1:-}" != "--no-install" ]; then
-  mkdir -p "$HOME/Applications"
+  mkdir -p "$APPS"
   rm -rf "$DEST"
   ditto "$APP" "$DEST"
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST"

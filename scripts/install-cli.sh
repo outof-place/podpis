@@ -13,11 +13,19 @@ fail() { echo "podpisz: $1" >&2; exit 1; }
 command -v "$PY" >/dev/null || fail "brak Pythona. Zainstaluj Pythona 3.11+ (python.org albo brew install python)."
 "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || fail "potrzebny Python 3.11 lub nowszy."
 command -v pdftotext >/dev/null || fail "brak poppler: brew install poppler"
-command -v xmlsec1 >/dev/null || fail "brak xmlsec1: brew install libxmlsec1"
+# xmlsec1 checks XML signatures only: without it everything but `podpisz xml` works.
+command -v xmlsec1 >/dev/null || echo "Uwaga: brak xmlsec1 (brew install libxmlsec1): bez niego nie działa podpisz xml."
 
 mkdir -p "$DATA" "$BIN"
 [ -x "$DATA/venv/bin/python" ] || "$PY" -m venv "$DATA/venv"
-"$DATA/venv/bin/python" -m pip install --quiet --disable-pip-version-check -r cli/requirements.txt
+PIP=("$DATA/venv/bin/python" -m pip install --quiet --disable-pip-version-check)
+if ! "${PIP[@]}" -r cli/requirements.txt; then
+  # python-pkcs11 is a C extension: on a Python too new for its wheels it has to build from source and
+  # may fail. Only the card needs it (status, pdf, xml); wyglad, miejsce, grafika and sprawdz do not.
+  "${PIP[@]}" $(grep -v '^python-pkcs11' cli/requirements.txt)
+  echo "Uwaga: python-pkcs11 się nie zainstalował, więc karta nie działa (status, pdf, xml)." \
+       "Działają wyglad, miejsce, grafika i sprawdz. Spróbuj z innym Pythonem: PYTHON=python3.13 $0"
+fi
 install -m 644 cli/podpisz.py "$DATA/podpisz.py"
 cat > "$BIN/podpisz" <<LAUNCHER
 #!/bin/sh
