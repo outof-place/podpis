@@ -19,6 +19,7 @@ from io import BytesIO
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CLI = os.path.join(ROOT, "cli", "podpisz.py")
 FIXTURE = os.path.join(ROOT, "Tests", "Fixtures", "wyglad-blok.pdf")
+FIXTURE_BEZ_LINII = os.path.join(ROOT, "Tests", "Fixtures", "wyglad-bez-linii.pdf")
 sys.path.insert(0, os.path.join(ROOT, "cli"))
 import podpisz as P  # noqa: E402
 
@@ -304,7 +305,7 @@ class WygladPodpisz(unittest.TestCase):
         self.assertTrue(data.startswith(read(self.base)))
         self.assertEqual(stamps(data), [])
         self.assertEqual(P._check_signatures(data)[0]["obejmuje"], "ENTIRE_FILE")
-        self.assertTrue(any("bez grafiki" in u for u in res["uwagi"]))
+        self.assertTrue(any("bez nowej grafiki" in u for u in res["uwagi"]))
 
     def test_refused_on_the_phone_leaves_nothing(self):
         out = tempfile.mkdtemp(dir=self.td)
@@ -313,6 +314,51 @@ class WygladPodpisz(unittest.TestCase):
                                   "Jan Kowalski")
         self.assertEqual(e.exception.kod, "podpis")
         self.assertEqual(os.listdir(out), [])
+
+    def test_block_without_a_line_gets_the_art_and_the_text_does_not(self):
+        res = P._wyglad_one(FIXTURE_BEZ_LINII, "Jan Kowalski", "15.10.2026",
+                            self.args(out_dir=tempfile.mkdtemp(dir=self.td)))
+        self.assertEqual([m["strona"] for m in res["miejsca"]], [1, 1])
+        # the subtitle, the text and the address above the street: no art
+        self.assertEqual(sum(s["powod"].startswith("nazwisko w treści") for s in res["pominiete"]), 3)
+        page = P._words(FIXTURE_BEZ_LINII)[0]
+        names = sorted(P._name_hits(page["words"], "Jan Kowalski"), key=lambda n: n[1])
+        self.assertEqual(len(names), 5)
+        arts = sorted(res["miejsca"], key=lambda m: -m["rect"][3])   # top first
+        for art, name in zip(arts, names[-2:]):   # the block with the line, then the one without
+            bottom = page["h"] - art["rect"][1]
+            self.assertLessEqual(bottom, name[1], "the art ends above the name")
+            self.assertGreater(bottom, name[1] - 16, "and close to it")
+            self.assertTrue(art["rect"][0] < name[2] and art["rect"][2] > name[0], "over the name")
+            self.assertEqual(art["skala"], 1.0)
+
+    def test_a_place_with_art_is_skipped_not_its_page(self):
+        data = read(FIXTURE_BEZ_LINII)
+        slots, _ = P._signature_lines(FIXTURE_BEZ_LINII, "Jan Kowalski", None, P._pages_meta(data))
+        upper = max(slots, key=lambda s: s["rect"][3])   # the block with the line
+        with tempfile.TemporaryDirectory() as td:
+            half = P._add_art(data, [upper], "15.10.2026", "Jan Kowalski", td)
+        src = os.path.join(tempfile.mkdtemp(dir=self.td), "polowa.pdf")
+        with open(src, "wb") as f:
+            f.write(half)
+        res = P._wyglad_one(src, "Jan Kowalski", "16.10.2026", self.args(out_dir=tempfile.mkdtemp(dir=self.td)))
+        self.assertEqual(len(res["miejsca"]), 1)
+        self.assertLess(res["miejsca"][0]["rect"][3], upper["rect"][1], "the block without the line, lower down")
+        self.assertIn("już ma grafikę podpisu z wyglad", [s["powod"] for s in res["pominiete"]])
+        self.assertEqual(len(stamps(read(res["plik"]))), 2)
+
+    def test_every_place_with_art_signed_again_not_twice(self):
+        first, _ = self.run_one(FIXTURE_BEZ_LINII)
+        res, _ = self.run_one(first["plik"])
+        self.assertEqual(res["cofniety"]["podpisal"], "Jan Kowalski")
+        self.assertEqual(res["miejsca"], [])
+        self.assertTrue(any("ma już grafikę" in u for u in res["uwagi"]), res["uwagi"])
+        data = read(res["plik"])
+        self.assertTrue(data.startswith(read(FIXTURE_BEZ_LINII)))
+        rows = P._check_signatures(data)
+        self.assertEqual([r["podpisal"] for r in rows], ["Jan Kowalski"])
+        self.assertEqual(rows[0]["obejmuje"], "ENTIRE_FILE")
+        self.assertEqual(len(stamps(data)), 2)
 
     def test_visible_signature_of_pdf_still_in_its_box(self):
         """`podpisz pdf` goes through the same _sign_pdf, with a rect."""

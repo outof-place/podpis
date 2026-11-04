@@ -803,6 +803,8 @@ SCALE_MIN = 0.6       # the art may shrink this far to keep off a picture (a sea
 PICTURE_CLEAR = 0.005  # share of picture pixels under the art that still counts as clear
 STAMP_FLAGS = 4 | 64 | 128 | 512   # Print, ReadOnly, Locked, LockedContents
 STAMP_NM = "podpis-wyglad-"
+CAPTION_LINES = 3      # a block without a line: the caption is in the first lines under the name
+CAPTION_WORDS = 8      # and short ("kwalifikowany podpis elektroniczny", "(podpis)")
 _RULE_TEXT = re.compile(r"^(.*?)(_{5,}|[.…]{8,})$")
 _TRIM = ".,;:()[]\"'„”«»"
 
@@ -889,6 +891,39 @@ def _drawn_rule(img, s, name):
     mid = (xa + xb) // 2
     left, right = reach(mid, -1) / s, reach(mid, 1) / s
     return (left, right, row / s, None) if right - left >= RULE_MIN else None
+
+
+def _caption_rule(words, name):
+    """A signature block without a line: the name alone in its column, and right under it, starting
+    where it starts, a short caption that says it is a signature ("kwalifikowany podpis elektroniczny",
+    maybe under a role: "pełnomocnik z uchwały nr 13/2026"). The art goes where the line would be:
+    (left, right, y, None), or None. A name in the text has words beside it; an address under a
+    name has no caption."""
+    x0, y0, x1, y1 = name
+    h = y1 - y0
+    if any(w[2] > x0 - 30.0 and w[0] < x1 + 40.0 for w in words
+           if _same_line(w, name) and not (w[0] >= x0 - 0.5 and w[2] <= x1 + 0.5)):
+        return None
+    lines = []
+    for w in sorted((w for w in words if w[1] > y1 - 0.5 * h and w[1] < y1 + CAPTION_LINES * 2.5 * h),
+                    key=lambda w: (w[1], w[0])):
+        for ln in lines:
+            if _same_line(ln[0], w):
+                ln.append(w)
+                break
+        else:
+            lines.append([w])
+    right, bottom, caption = x1, y1, False
+    for ln in sorted(lines, key=lambda ln: min(w[1] for w in ln))[:CAPTION_LINES]:
+        col = [w for w in ln if w[0] >= x0 - 3.0]   # a label column to the left is not the block's
+        if not col or abs(min(w[0] for w in col) - x0) > 3.0 or min(w[1] for w in col) - bottom > h:
+            break
+        if len(col) <= CAPTION_WORDS and "PODPIS" in _fold(" ".join(w[4] for w in col)):
+            caption = True
+        right, bottom = max(right, max(w[2] for w in col)), max(w[3] for w in col)
+    if not caption:
+        return None
+    return (x0, max(right, x0 + RULE_MIN), y0 - 2.0, None)
 
 
 def _art_box(words, annots, pictures, s, name, rule, pw):
@@ -983,16 +1018,17 @@ def _pages_meta(data):
             return
         box = find_inherited_value_in_tree(node, "/CropBox", "/Parent") or \
             find_inherited_value_in_tree(node, "/MediaBox", "/Parent")
-        annots, ours = [], False
+        annots, ours = [], []
         for a in node.get("/Annots", []) or []:
             a = a.get_object()
-            ours = ours or str(a.get("/NM", "")).startswith(STAMP_NM)
             try:
                 ax0, ay0, ax1, ay1 = [float(v) for v in a["/Rect"]]
             except (KeyError, TypeError, ValueError):
                 continue
             if abs(ax1 - ax0) * abs(ay1 - ay0) > 0:
                 annots.append((min(ax0, ax1), min(ay0, ay1), max(ax0, ax1), max(ay0, ay1)))
+                if str(a.get("/NM", "")).startswith(STAMP_NM):   # art from an earlier wyglad, and whose
+                    ours.append((annots[-1], str(a.get("/T", ""))))
         bx = [float(v) for v in box]
         out.append({"box": (min(bx[0], bx[2]), min(bx[1], bx[3]), max(bx[0], bx[2]), max(bx[1], bx[3])),
                     "rotate": int(find_inherited_value_in_tree(node, "/Rotate", "/Parent") or 0) % 360,
@@ -1008,10 +1044,12 @@ def _signature_lines(pdf, nad, strona, meta):
     A signature line of a name is a rule, typed (underscores, dots) or drawn (at most 3 pt thick,
     at least 60 pt long), at most 30 pt above the name and reaching over it, with nothing on the
     name's line between the start of the rule and the name but a label ending with ':' ("Name:"),
-    and room above it for the art. A name in the text (the parties, a definition, a table) has no
-    such rule over it. Every such line on every page counts: one person may sign twice (for a
-    company and in person), and annexes and exhibits bound into the file carry their own blocks.
-    --strona keeps the art to one page.
+    and room above it for the art. A block without a rule counts too when the name stands alone
+    with a signature caption under it (_caption_rule). A name in the text (the parties, a
+    definition, a table) has neither. Every such place on every page counts: one person may sign
+    twice (for a company and in person), and annexes and exhibits bound into the file carry their
+    own blocks. A place that already has this person's art from an earlier wyglad is skipped, the
+    others on its page are not. --strona keeps the art to one page.
     """
     from PIL import Image, ImageDraw
     scale = 2.0
@@ -1021,15 +1059,21 @@ def _signature_lines(pdf, nad, strona, meta):
         if not hits:
             continue
         m = meta[pi]
-        if m["ours"]:
-            skipped.append({"strona": pi + 1, "powod": "już ma grafikę podpisu z wyglad"})
-            continue
         if m["rotate"]:
             skipped.append({"strona": pi + 1, "powod": f"strona obrócona o {m['rotate']} stopni"})
             continue
         bx0, by0, _, by1 = m["box"]
         ph = p["h"]
         annots = [(a[0] - bx0, ph - (a[3] - by0), a[2] - bx0, ph - (a[1] - by0)) for a in m["annots"]]
+        # this person's art from an earlier wyglad belongs to the name it stands over (or beside)
+        done = set()
+        for a, who in m["ours"]:
+            if _fold(who) != _fold(nad):
+                continue
+            a = (a[0] - bx0, ph - (a[3] - by0), a[2] - bx0, ph - (a[1] - by0))
+            near = [(abs(n[1] - a[3]), i) for i, n in enumerate(hits) if -30.0 <= n[1] - a[3] <= 60.0]
+            if near:
+                done.add(min(near)[1])
         img = pictures = None
 
         def render():
@@ -1039,11 +1083,16 @@ def _signature_lines(pdf, nad, strona, meta):
                                 "-l", str(pi + 1), "-singlefile", pdf, base], check=True)
                 return Image.open(base + ".png").convert("L")
 
-        for name in hits:
+        for i, name in enumerate(hits):
+            if i in done:
+                skipped.append({"strona": pi + 1, "powod": "już ma grafikę podpisu z wyglad"})
+                continue
             rule = _text_rule(p["words"], name)
             if rule is None:
                 img = img or render()
                 rule = _drawn_rule(img, scale, name)
+            if rule is None:
+                rule = _caption_rule(p["words"], name)
             if rule is None:
                 skipped.append({"strona": pi + 1, "powod": "nazwisko w treści (nie ma nad nim linii podpisu)"})
                 continue
@@ -1075,6 +1124,8 @@ def _signature_lines(pdf, nad, strona, meta):
                 skipped.extend({"strona": other, "powod": "inna strona niż --strona"} for _ in found[other])
         found = {strona: found[strona]}
     if not found:
+        if any(s["powod"] == "już ma grafikę podpisu z wyglad" for s in skipped):
+            raise Blad("brak_linii", f"Każda linia podpisu nad „{nad}” ma już grafikę.")
         raise Blad("brak_linii", f"Nie znalazłem linii podpisu nad „{nad}”.")
     return [{"strona": page, **r} for page in sorted(found) for r in found[page]], skipped
 
@@ -1338,10 +1389,16 @@ def _wyglad_podpisz_one(plik, nad, when, args, signer, name):
             if e.kod != "brak_linii":
                 raise
             with open(plik, "rb") as f:
-                if not f.read(5).startswith(b"%PDF"):
-                    raise Blad("nie_pdf", "To nie jest PDF.")
-            res = {"zrodlo": plik, "plik": plik, "cofniety": None, "miejsca": [], "pominiete": [],
-                   "uwagi": [f"{e.tekst} Podpisałem bez grafiki."]}
+                data = f.read()
+            if not data.startswith(b"%PDF"):
+                raise Blad("nie_pdf", "To nie jest PDF.")
+            # your own last signature goes, as with the art: signed again, not twice
+            base, cofniety = (data, None) if args.bez_cofania else _cut_last(data, nad)
+            src = os.path.join(td, "bez-grafiki.pdf")
+            with open(src, "wb") as f:
+                f.write(base)
+            res = {"zrodlo": plik, "plik": src, "cofniety": cofniety, "miejsca": [], "pominiete": [],
+                   "uwagi": [f"{e.tekst} Podpisałem bez nowej grafiki."]}
         signed_path = os.path.join(td, "podpisany.pdf")
         _show_cloudsigner(signer)
         try:

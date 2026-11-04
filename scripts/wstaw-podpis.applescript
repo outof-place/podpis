@@ -15,7 +15,7 @@ on run
 	if signs of cfg then
 		display dialog "Upuść pliki PDF na ikonę „Wstaw podpis”." & return & return & ¬
 			"Na każdej linii podpisu z Twoim imieniem i nazwiskiem stanie grafika Twojego podpisu, a potem plik podpiszesz " & (how of cfg) & ". Wynik ląduje obok oryginału jako „…-podpisany.pdf”." & return & return & ¬
-			"Gdy w pliku nie ma linii podpisu z Twoim nazwiskiem, podpis będzie bez grafiki. Gdy ostatni podpis w pliku jest Twój, zostanie zastąpiony nowym, już z grafiką." buttons {"OK"} default button "OK" with title appName
+			"Gdy w pliku nie ma nowej linii podpisu z Twoim nazwiskiem, podpis będzie bez nowej grafiki. Gdy ostatni podpis w pliku jest Twój, zostanie zastąpiony nowym, już z grafiką." buttons {"OK"} default button "OK" with title appName
 	else
 		display dialog "Upuść pliki PDF na ikonę „Wstaw podpis”." & return & return & ¬
 			"Na każdej linii podpisu z Twoim imieniem i nazwiskiem stanie grafika Twojego podpisu. Wynik ląduje obok oryginału jako „…-do-podpisu.pdf”. Ten plik podpisujesz potem swoim narzędziem do podpisu." & return & return & ¬
@@ -85,7 +85,7 @@ on open dropped
 	if done is not {} then
 		if signs of cfg then
 			set msg to "Podpisane: " & (count of done) & " z " & (count of results) & " (linii podpisu: " & lineCount & ")."
-			if noArtCount > 0 then set msg to msg & " Bez grafiki, bo bez linii z Twoim nazwiskiem: " & noArtCount & "."
+			if noArtCount > 0 then set msg to msg & " Bez nowej grafiki (brak nowych linii z Twoim nazwiskiem): " & noArtCount & "."
 			if cutCount > 0 then set msg to msg & " Twój wcześniejszy podpis zastąpiony nowym: " & cutCount & "."
 		else
 			set msg to "Gotowe: " & (count of done) & " z " & (count of results) & " (linii podpisu: " & lineCount & ")."

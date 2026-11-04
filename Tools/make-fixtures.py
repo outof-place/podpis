@@ -87,6 +87,25 @@ DOCS["wyglad-blok.pdf"] = f"""<h1>UMOWA INWESTYCYJNA nr 9/2026</h1>
 <div class="brk"></div><h1>Załącznik nr 1</h1><div class="sub">wzór oświadczenia założyciela</div>
 {paragraphs(1)}<div class="by"><p>By: ________________________</p><p>Name: Jan Kowalski</p></div>"""
 
+# A block with a drawn line and one without (an attorney's signature for the company), both of
+# Jan Kowalski, the way the Outofplace partnership agreement has them; his name also in the text
+# and above an address, where no art goes.
+BLOCK = """<div style="display:flex;margin-top:12mm"><div style="width:38mm;color:#555;font-style:italic">{label}</div>
+<div style="width:72mm">{rule}<b>{name}</b>{caps}</div></div>"""
+RULE = '<div style="border-top:0.8pt solid #222;margin-top:12mm;padding-top:1mm"></div>'
+CAP = '<div style="font-style:italic;color:#555">{}</div>'
+SPACE = '<div style="height:12mm"></div>'   # where the line would be, without one
+
+DOCS["wyglad-bez-linii.pdf"] = f"""<h1>UMOWA WSPÓLNIKÓW</h1>
+<div class="sub">Jan Kowalski · Anna Nowak · Przykładowa Spółka sp. z o.o.</div>
+<p>W sprawach między Spółką a członkiem jej zarządu Spółkę reprezentuje Jan Kowalski, pełnomocnik powołany uchwałą wspólników nr 1/2026.</p>
+<p>Adres do doręczeń:</p><p style="text-align:left">Jan Kowalski<br>ul. Polna 1, 00-001 Warszawa</p>
+{paragraphs(2)}
+{BLOCK.format(label='Wspólnik', rule=RULE, name='Jan Kowalski', caps=CAP.format('kwalifikowany podpis elektroniczny'))}
+{BLOCK.format(label='Wspólnik', rule=RULE, name='Anna Nowak', caps=CAP.format('kwalifikowany podpis elektroniczny'))}
+{BLOCK.format(label='Spółka<br>(art. 210 § 1 KSH)', rule=SPACE, name='Jan Kowalski',
+              caps=CAP.format('pełnomocnik z uchwały nr 1/2026') + CAP.format('kwalifikowany podpis elektroniczny'))}"""
+
 XML = """<?xml version="1.0" encoding="UTF-8"?>
 <Deklaracja xmlns="http://example.com/deklaracja/2026">
   <Naglowek>
