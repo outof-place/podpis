@@ -133,7 +133,8 @@ def _is_cloudsigner(path):
 
 def _start_cloudsigner(driver):
     """mSzafir's driver needs CloudSigner running: its RepoServer serves the virtual card, and its
-    window asks for the code from the phone. Start it in the background when it is not running."""
+    window asks for the code from the phone. Start it when it is not running: in the front, because
+    after a start in the background (open -g) its window did not show the signing request."""
     def up():
         return all(subprocess.run(["/usr/bin/pgrep", "-x", "-U", str(os.getuid()), name],
                                   capture_output=True).returncode == 0
@@ -141,7 +142,7 @@ def _start_cloudsigner(driver):
     if up():
         return
     app = driver.split("/Contents/")[0]
-    subprocess.run(["/usr/bin/open", "-g", "-a", app], capture_output=True)
+    subprocess.run(["/usr/bin/open", "-a", app], capture_output=True)
     deadline = time.time() + CLOUDSIGNER_START_S
     while not up():
         if time.time() > deadline:
@@ -522,6 +523,18 @@ def _signer(session, pin):
     return signer, _cert_info(der)["imie_nazwisko"]
 
 
+def _show_cloudsigner(signer):
+    """mSzafir: CloudSigner's window asks for the phone's code and lists the request, but it opens
+    behind other windows, and a droplet run has no terminal to look at. Bring CloudSigner to the
+    front once the signature is under way. A card or a test signer: nothing to show."""
+    from pyhanko.sign.pkcs11 import PKCS11Signer
+    if not isinstance(signer, PKCS11Signer) or not _is_cloudsigner(_driver()):
+        return
+    app = _driver().split("/Contents/")[0]
+    subprocess.Popen(["/bin/sh", "-c", 'sleep 1.5; exec /usr/bin/open -a "$0"', app], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def _sign_pdf(src, out, signer, name, page=None, rect=None, seal=False):
     """PAdES baseline B over `src` into `out` as an incremental update: visible in `rect` on `page`,
     or invisible without a rect. `out` appears only once the signature is done."""
@@ -572,6 +585,7 @@ def _sign_one_pdf(args, plik, signer, name):
     else:
         raise Blad("brak_miejsca", "Podaj --nad TEKST albo --strona N --rect x1 y1 x2 y2.")
     out = args.out or re.sub(r"\.pdf$", "", plik, flags=re.I) + PODPISANY_SUFFIX + ".pdf"
+    _show_cloudsigner(signer)
     _sign_pdf(plik, out, signer, name, page, rect, seal)
     orig = open(plik, "rb").read()
     signed = open(out, "rb").read()
@@ -1329,6 +1343,7 @@ def _wyglad_podpisz_one(plik, nad, when, args, signer, name):
             res = {"zrodlo": plik, "plik": plik, "cofniety": None, "miejsca": [], "pominiete": [],
                    "uwagi": [f"{e.tekst} Podpisałem bez grafiki."]}
         signed_path = os.path.join(td, "podpisany.pdf")
+        _show_cloudsigner(signer)
         try:
             _sign_pdf(res["plik"], signed_path, signer, name)
         except pkcs11.exceptions.PKCS11Error as e:

@@ -83,6 +83,13 @@ Dla mSzafira wystarczy:
 
 Kartę mSzafir dodajesz raz w CloudSignerze: ikona CloudSigner na pasku menu, Certyfikaty, Dodaj nową kartę do systemu, i kod z aplikacji mSzafir na telefonie (Generuj kod). `podpisz status` pokazuje potem kartę i certyfikat.
 
+W ustawieniach CloudSignera (koło zębate) włącz dwie rzeczy:
+
+- **Ukryj okno aplikacji po udanym podpisie.** Bez tego okno zostaje otwarte z napisem „Transakcja zakończona”, a następna prośba o podpis nie pokazuje się, dopóki go nie zamkniesz. `podpisz` wisi wtedy i czeka.
+- **Trwały kod OTT.** Kod z telefonu wpisujesz raz na uruchomienie CloudSignera, a kolejne podpisy już tylko zatwierdzasz na telefonie.
+
+Przy podpisie mSzafirem `podpisz` wyciąga okno CloudSignera na wierzch, bo bez tego potrafi się otworzyć za innymi oknami.
+
 Zmienne środowiskowe: `PODPIS_HOME` (folder ustawień), `PODPIS_PKCS11` (ścieżka sterownika), `PODPIS_PRZEGLADARKA` (przeglądarka), `PODPIS_CLI` (którego `podpisz` używa aplikacja).
 
 ## Terminal

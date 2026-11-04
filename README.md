@@ -83,6 +83,13 @@ For mSzafir this is enough:
 
 You add the mSzafir card to CloudSigner once: the CloudSigner icon in the menu bar, Certyfikaty, Dodaj nową kartę do systemu, and the code from the mSzafir app on your phone (Generuj kod). `podpisz status` then shows the card and the certificate.
 
+In CloudSigner's settings (the cog), turn on two things:
+
+- **Ukryj okno aplikacji po udanym podpisie** (hide the window after a successful signature). Without it the window stays open with "Transakcja zakończona", and the next signing request does not show until you close it. `podpisz` then hangs and waits.
+- **Trwały kod OTT** (persistent code). You type the phone's code once per CloudSigner run, and after that you only approve each signature on the phone.
+
+When it signs with mSzafir, `podpisz` brings CloudSigner's window to the front, because it can otherwise open behind other windows.
+
 Environment variables: `PODPIS_HOME` (settings folder), `PODPIS_PKCS11` (driver path), `PODPIS_PRZEGLADARKA` (browser binary), `PODPIS_CLI` (which `podpisz` the app runs).
 
 ## Command line
