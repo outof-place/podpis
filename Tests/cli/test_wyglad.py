@@ -216,6 +216,117 @@ class Wyglad(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(res["pliki"][0]["kod"], "brak_linii")
 
+    def test_podpisz_without_a_driver_writes_nothing(self):
+        out = tempfile.mkdtemp(dir=self.td)
+        r = subprocess.run([sys.executable, "-I", CLI, "wyglad", "--json", "--podpisz", "--nad", "Jan Kowalski",
+                            "--out-dir", out, self.base], capture_output=True, text=True,
+                           env={**os.environ, "PODPIS_HOME": self.home,
+                                "PODPIS_PKCS11": os.path.join(self.td, "libCloudSignerP11.dylib")})
+        res = json.loads(r.stdout)
+        self.assertEqual(r.returncode, 2, res)
+        self.assertEqual(res["kod"], "brak_sterownika")
+        self.assertIn("CloudSigner", res["blad"])
+        self.assertEqual(os.listdir(out), [])
+
+
+class Refused(Exception):
+    pass
+
+
+class WygladPodpisz(unittest.TestCase):
+    """`wyglad --podpisz`: the art, then the token's invisible signature over it, in one step. The
+    token is stood in for by pyHanko signers with throwaway keys, called in process."""
+
+    @classmethod
+    def setUpClass(cls):
+        import argparse
+        import pkcs11
+        from pyhanko.sign import fields, signers
+        cls.td = tempfile.mkdtemp(prefix="podpis-wyglad-podpisz-test-")
+        P.HOME, P._CONFIG = os.path.join(cls.td, "home"), {}   # the name in a script font, as in Wyglad
+        cls.base = os.path.join(cls.td, "umowa.pdf")
+        shutil.copyfile(FIXTURE, cls.base)
+        cls.jan_signer = make_signer(cls.td, "Jan Kowalski")
+        cls.jan = os.path.join(cls.td, "umowa-jan.pdf")
+        sign(cls.base, cls.jan, cls.jan_signer, "Signature1", fields.SigSeedSubFilter.ADOBE_PKCS7_DETACHED)
+
+        class RefusingSigner(signers.SimpleSigner):
+            async def async_sign_raw(self, data, digest_algorithm, dry_run=False):
+                if dry_run:
+                    return await super().async_sign_raw(data, digest_algorithm, dry_run)
+                raise pkcs11.exceptions.FunctionCancelled()
+        cls.refusing = RefusingSigner(cls.jan_signer.signing_cert, cls.jan_signer.signing_key,
+                                      cls.jan_signer.cert_registry)
+        cls.args = lambda self, **kw: argparse.Namespace(**{"out_dir": None, "strona": None, "bez_cofania": False, **kw})
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.td, ignore_errors=True)
+
+    def run_one(self, src, nad="Jan Kowalski", signer=None):
+        out = tempfile.mkdtemp(dir=self.td)
+        res = P._wyglad_podpisz_one(src, nad, "15.10.2026", self.args(out_dir=out), signer or self.jan_signer,
+                                    "Jan Kowalski")
+        return res, out
+
+    def test_art_then_one_signature_over_it(self):
+        res, out = self.run_one(self.base)
+        self.assertEqual(os.listdir(out), ["umowa.pdf"])   # the signed file only, no -do-podpisu
+        data = read(res["plik"])
+        self.assertTrue(data.startswith(read(self.base)))
+        self.assertEqual([m["strona"] for m in res["miejsca"]], [2, 2, 3])
+        self.assertEqual([p for p, _ in stamps(data)], [2, 2, 3])
+        rows = P._check_signatures(data)
+        self.assertEqual([r["podpisal"] for r in rows], ["Jan Kowalski"])
+        self.assertTrue(rows[0]["integralnosc"])
+        self.assertEqual(rows[0]["obejmuje"], "ENTIRE_FILE")
+
+    def test_next_to_the_original_with_podpisany(self):
+        src = os.path.join(tempfile.mkdtemp(dir=self.td), "aneks.pdf")
+        shutil.copyfile(self.base, src)
+        res = P._wyglad_podpisz_one(src, "Jan Kowalski", "15.10.2026", self.args(), self.jan_signer, "Jan Kowalski")
+        self.assertEqual(res["plik"], os.path.join(os.path.dirname(src), "aneks-podpisany.pdf"))
+        self.assertEqual(sorted(os.listdir(os.path.dirname(src))), ["aneks-podpisany.pdf", "aneks.pdf"])
+
+    def test_own_last_signature_cut_and_signed_again(self):
+        res, _ = self.run_one(self.jan)
+        self.assertEqual(res["cofniety"]["podpisal"], "Jan Kowalski")
+        data = read(res["plik"])
+        self.assertTrue(data.startswith(read(self.base)))
+        rows = P._check_signatures(data)
+        self.assertEqual([r["podpisal"] for r in rows], ["Jan Kowalski"])
+        self.assertEqual(rows[0]["obejmuje"], "ENTIRE_FILE")
+        self.assertEqual(res["uwagi"], [])
+
+    def test_no_signature_line_signs_without_art(self):
+        res, _ = self.run_one(self.base, nad="Anna Kowalska")
+        data = read(res["plik"])
+        self.assertTrue(data.startswith(read(self.base)))
+        self.assertEqual(stamps(data), [])
+        self.assertEqual(P._check_signatures(data)[0]["obejmuje"], "ENTIRE_FILE")
+        self.assertTrue(any("bez grafiki" in u for u in res["uwagi"]))
+
+    def test_refused_on_the_phone_leaves_nothing(self):
+        out = tempfile.mkdtemp(dir=self.td)
+        with self.assertRaises(P.Blad) as e:
+            P._wyglad_podpisz_one(self.base, "Jan Kowalski", "15.10.2026", self.args(out_dir=out), self.refusing,
+                                  "Jan Kowalski")
+        self.assertEqual(e.exception.kod, "podpis")
+        self.assertEqual(os.listdir(out), [])
+
+    def test_visible_signature_of_pdf_still_in_its_box(self):
+        """`podpisz pdf` goes through the same _sign_pdf, with a rect."""
+        from pyhanko.pdf_utils.reader import PdfFileReader
+        place = P._place(self.base, "Anna Nowak")   # the line Podpis.app would sign on
+        out = os.path.join(tempfile.mkdtemp(dir=self.td), "widoczny.pdf")
+        P._sign_pdf(self.base, out, self.jan_signer, "Jan Kowalski", place["strona"], place["rect"])
+        data = read(out)
+        self.assertTrue(data.startswith(read(self.base)))
+        sig = PdfFileReader(BytesIO(data), strict=False).embedded_signatures[0]
+        rect = [float(v) for v in sig.sig_field["/Rect"]]
+        self.assertEqual(rect, [float(int(round(v))) for v in place["rect"]])
+        self.assertEqual(P._check_signatures(data)[0]["obejmuje"], "ENTIRE_FILE")
+
 
 if __name__ == "__main__":
     unittest.main()

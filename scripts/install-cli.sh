@@ -37,7 +37,8 @@ echo "Zainstalowano: $BIN/podpisz"
 # What the CLI needs at run time but cannot install itself.
 [ -e "$DATA/libPKCS11Graphite.dylib" ] || [ -e /Applications/Szafir2.app/Contents/app/libPKCS11Graphite.dylib ] \
   || [ -e "$HOME/Applications/Szafir2.app/Contents/app/libPKCS11Graphite.dylib" ] || [ -n "${PODPIS_PKCS11:-}" ] \
-  || echo "Uwaga: nie widzę sterownika karty. Zainstaluj Szafir2 od KIR (sterownik jest w jego paczce) albo ustaw PODPIS_PKCS11."
+  || [ -e /Applications/CloudSigner.app/Contents/Frameworks/libCloudSignerP11.dylib ] \
+  || echo "Uwaga: nie widzę sterownika. Zainstaluj Szafir2 od KIR (karta) albo CloudSigner (mSzafir), albo ustaw PODPIS_PKCS11."
 browser=""
 for app in "Google Chrome" Chromium "Brave Browser" "Microsoft Edge"; do
   [ -e "/Applications/$app.app" ] || [ -e "$HOME/Applications/$app.app" ] && browser=$app

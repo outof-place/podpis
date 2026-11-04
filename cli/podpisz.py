@@ -5,6 +5,11 @@ The card's own PKCS#11 driver (CryptoTech Graphite, a universal binary shipped i
 Szafir2.app) talks to the QSCD token. The signature is computed on the card, so the
 result is a qualified electronic signature, the same as Szafir's.
 
+mSzafir, KIR's remote (cloud) qualified signature, goes through the PKCS#11 driver of
+CloudSigner (CryptoTech, libCloudSignerP11.dylib) instead: "sterownik": "mszafir" in
+config.json. There is no PIN: CloudSigner asks for the code from the mSzafir phone app
+and the signature is approved on the phone.
+
 Every call is a fresh process that loads the driver anew, so a reader plugged in
 after boot is seen without restarting anything. Nothing runs in the background.
 
@@ -17,9 +22,10 @@ Commands (add --json for machine output; exit 0 = ok):
                                  update (the original stays a byte prefix)
   xml XML [--out OUT]            XAdES-BES enveloped (RSA-SHA256, exc-c14n)
   sprawdz PLIK                   verify a signed PDF or XML
-  wyglad PDF... [--nad TEKST] [--out-dir DIR] [--bez-cofania]
+  wyglad PDF... [--nad TEKST] [--out-dir DIR] [--bez-cofania] [--podpisz]
                                  the signature art on every signature line of TEKST, for a
-                                 signature made with another tool afterwards (no card, no PIN)
+                                 signature made with another tool afterwards (no card, no PIN);
+                                 with --podpisz the token signs it right away, invisibly
 
 PIN: env PODPIS_PIN, or --pin-stdin, otherwise a native macOS prompt. It is never
 written to disk or printed. A wrong PIN is never retried automatically.
@@ -46,11 +52,16 @@ HOME = os.environ.get("PODPIS_HOME") or os.path.expanduser("~/.local/share/podpi
 QSCD_LABEL = "PKI Token 2 (QSCD)"
 STAMP_W, STAMP_W_SEAL, STAMP_H_MAX, STAMP_H_MIN = 140.0, 190.0, 48.0, 32.0
 GAP_ABOVE = 4.0
-DRIVERS = [
+CARD_DRIVERS = [
     os.path.join(HOME, "libPKCS11Graphite.dylib"),
     "/Applications/Szafir2.app/Contents/app/libPKCS11Graphite.dylib",
     os.path.expanduser("~/Applications/Szafir2.app/Contents/app/libPKCS11Graphite.dylib"),
 ]
+# mSzafir: this driver talks to CloudSigner's RepoServer, which runs while the CloudSigner app does
+CLOUDSIGNER_DRIVER = "/Applications/CloudSigner.app/Contents/Frameworks/libCloudSignerP11.dylib"
+DRIVERS = CARD_DRIVERS + [CLOUDSIGNER_DRIVER]
+CLOUDSIGNER_START_S = 30
+PODPISANY_SUFFIX = "-podpisany"
 BROWSERS = [
     os.path.join(root, app, "Contents/MacOS", binary)
     for root in ("/Applications", os.path.expanduser("~/Applications"))
@@ -100,11 +111,44 @@ def _first_existing(explicit, candidates):
 
 
 def _driver():
-    path = _first_existing(os.environ.get("PODPIS_PKCS11") or _config().get("sterownik"), DRIVERS)
+    """The PKCS#11 driver: a path, "mszafir" (CloudSigner) or "karta" (Szafir2's), else the first found."""
+    explicit = os.environ.get("PODPIS_PKCS11") or _config().get("sterownik")
+    if explicit == "mszafir":
+        explicit = CLOUDSIGNER_DRIVER
+    path = _first_existing(None if explicit == "karta" else explicit,
+                           CARD_DRIVERS if explicit == "karta" else DRIVERS)
+    if path and _is_cloudsigner(path) and not os.path.exists(path):
+        raise Blad("brak_sterownika", "Nie widzę CloudSignera (mSzafir). Zainstaluj go od KIR: "
+                                      "elektronicznypodpis.pl, Aplikacje i sterowniki.")
     if not path or not os.path.exists(path):
-        raise Blad("brak_sterownika", "Nie widzę sterownika karty (libPKCS11Graphite.dylib). "
-                                      "Zainstaluj Szafir2 od KIR albo podaj ścieżkę w PODPIS_PKCS11.")
+        raise Blad("brak_sterownika", "Nie widzę sterownika karty (libPKCS11Graphite.dylib) ani CloudSignera "
+                                      "(mSzafir). Zainstaluj Szafir2 albo CloudSigner od KIR, "
+                                      "albo podaj ścieżkę w PODPIS_PKCS11.")
     return path
+
+
+def _is_cloudsigner(path):
+    return os.path.basename(path).startswith("libCloudSignerP11")
+
+
+def _start_cloudsigner(driver):
+    """mSzafir's driver needs CloudSigner running: its RepoServer serves the virtual card, and its
+    window asks for the code from the phone. Start it in the background when it is not running."""
+    def up():
+        return all(subprocess.run(["/usr/bin/pgrep", "-x", "-U", str(os.getuid()), name],
+                                  capture_output=True).returncode == 0
+                   for name in ("CloudSignerNg", "RepoServer"))
+    if up():
+        return
+    app = driver.split("/Contents/")[0]
+    subprocess.run(["/usr/bin/open", "-g", "-a", app], capture_output=True)
+    deadline = time.time() + CLOUDSIGNER_START_S
+    while not up():
+        if time.time() > deadline:
+            raise Blad("cloudsigner", f"CloudSigner (mSzafir) nie wystartował w {CLOUDSIGNER_START_S} s. "
+                                      "Otwórz go z folderu Aplikacje.")
+        time.sleep(0.5)
+    time.sleep(2)   # RepoServer loads the card list after it starts
 
 
 def _browser():
@@ -118,7 +162,22 @@ def _browser():
 
 def _token():
     import pkcs11
-    lib = pkcs11.lib(_driver())
+    driver = _driver()
+    if _is_cloudsigner(driver):
+        _start_cloudsigner(driver)
+        tokens = [s.get_token() for s in pkcs11.lib(driver).get_slots(token_present=True)]
+        label = _config().get("token")
+        if label:
+            tokens = [t for t in tokens if t.label == label]
+        if len(tokens) == 1:
+            return tokens[0]
+        if tokens:
+            raise Blad("token", "CloudSigner ma kilka kart: " + ", ".join(t.label for t in tokens)
+                       + ". Wpisz właściwą jako \"token\" w config.json.")
+        raise Blad("brak_karty", "CloudSigner nie ma karty mSzafir" + (f" „{label}”" if label else "")
+                   + ". Dodaj ją: ikona CloudSigner na pasku menu, Certyfikaty, Dodaj nową kartę, "
+                     "i kod z aplikacji mSzafir na telefonie (Generuj kod).")
+    lib = pkcs11.lib(driver)
     slots = lib.get_slots(token_present=False)
     if not slots:
         raise Blad("brak_czytnika", "Nie widzę czytnika. Podłącz czytnik i spróbuj ponownie.")
@@ -144,8 +203,12 @@ def _pin_flags(tok):
 def _cert_der(session):
     from pkcs11 import Attribute, ObjectClass
     certs = list(session.get_objects({Attribute.CLASS: ObjectClass.CERTIFICATE}))
+    if len(certs) > 1:
+        # mSzafir's token also carries KIR's root CA and a TLS certificate: the signer's has the private key
+        keys = {k[Attribute.ID] for k in session.get_objects({Attribute.CLASS: ObjectClass.PRIVATE_KEY})}
+        certs = [c for c in certs if c[Attribute.ID] in keys]
     if len(certs) != 1:
-        raise Blad("certyfikat", f"Spodziewany jeden certyfikat w tokenie QSCD, jest {len(certs)}.")
+        raise Blad("certyfikat", f"Spodziewany jeden certyfikat z kluczem w tokenie, jest {len(certs)}.")
     return certs[0][Attribute.VALUE], certs[0][Attribute.ID]
 
 
@@ -192,8 +255,15 @@ def _close(session):
 
 
 def _open_signing_session(args):
+    """A session that can sign, and the PIN for the key's context-specific login (None for mSzafir)."""
     import pkcs11
+    from pkcs11.constants import TokenFlag
     tok = _token()
+    if _is_cloudsigner(_driver()):
+        # no PIN: CloudSigner itself asks for the phone's code and the phone approves the signature
+        if not tok.flags & TokenFlag.LOGIN_REQUIRED:
+            return tok.open(), None
+        return tok.open(user_pin=pkcs11.PROTECTED_AUTH), None
     flags = _pin_flags(tok)
     if flags["ostatnia_proba"] and not args.wymus:
         raise Blad("ostatnia_proba", "Karta ma ostatnią próbę PIN-u. Nie zgaduję; użyj --wymus, gdy PIN jest pewny.")
@@ -436,20 +506,63 @@ def cmd_pdf(args):
         _seal_config()  # fail before the PIN, not after
     session, pin = _open_signing_session(args)
     try:
-        wyniki = [_sign_one_pdf(args, f, session, pin) for f in args.plik]
+        signer, name = _signer(session, pin)
+        wyniki = [_sign_one_pdf(args, f, signer, name) for f in args.plik]
     finally:
         _close(session)
     return {"ok": all(w["ok"] for w in wyniki), "pliki": wyniki}
 
 
-def _sign_one_pdf(args, plik, session, pin):
+def _signer(session, pin):
+    """pyHanko's signer over the token's key, and the signer's name from the certificate."""
+    from pyhanko.sign.pkcs11 import PKCS11Signer
+    der, cid = _cert_der(session)
+    # the QSCD key needs a context-specific login before every signature; mSzafir's has no PIN
+    signer = PKCS11Signer(session, cert_id=cid, key_id=cid, base_sign_kwargs={"pin": pin} if pin else None)
+    return signer, _cert_info(der)["imie_nazwisko"]
+
+
+def _sign_pdf(src, out, signer, name, page=None, rect=None, seal=False):
+    """PAdES baseline B over `src` into `out` as an incremental update: visible in `rect` on `page`,
+    or invisible without a rect. `out` appears only once the signature is done."""
     from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
     from pyhanko.pdf_utils.layout import AxisAlignment, InnerScaling, Margins, SimpleBoxLayoutRule
     from pyhanko.sign import fields, signers
     from pyhanko.sign.ades.api import CAdESSignedAttrSpec, GenericCommitment
-    from pyhanko.sign.pkcs11 import PKCS11Signer
     from pyhanko.stamp import StaticStampStyle
 
+    field = f"Podpis_{name.replace(' ', '_')}_{datetime.now():%Y%m%d%H%M%S}"
+    meta = signers.PdfSignatureMetadata(
+        field_name=field, md_algorithm="sha256", subfilter=fields.SigSeedSubFilter.PADES,
+        name=name,
+        cades_signed_attr_spec=CAdESSignedAttrSpec(commitment_type=GenericCommitment.PROOF_OF_APPROVAL.asn1),
+    )
+    stamp = None
+    with open(src, "rb") as inf:
+        w = IncrementalPdfFileWriter(inf, strict=False)
+        if rect:
+            x1, y1, x2, y2 = [int(round(v)) for v in rect]
+            art = os.path.join(tempfile.mkdtemp(prefix="podpis-"), "pieczec.pdf")
+            _stamp_pdf(art, datetime.now().strftime("%d.%m.%Y, %H:%M"), x2 - x1, y2 - y1, seal, name)
+            stamp = StaticStampStyle.from_pdf_file(
+                art, border_width=0,
+                background_layout=SimpleBoxLayoutRule(
+                    x_align=AxisAlignment.ALIGN_MID, y_align=AxisAlignment.ALIGN_MID,
+                    margins=Margins(0, 0, 0, 0), inner_content_scaling=InnerScaling.STRETCH_FILL))
+            fields.append_signature_field(w, fields.SigFieldSpec(sig_field_name=field, on_page=page - 1,
+                                                                 box=(x1, y1, x2, y2)))
+        tmp = out + ".tmp"
+        try:
+            with open(tmp, "wb") as outf:
+                signers.PdfSigner(meta, signer=signer, stamp_style=stamp).sign_pdf(w, output=outf)
+        except BaseException:   # refused on the phone, card pulled: no half-written file left behind
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+    os.replace(tmp, out)
+
+
+def _sign_one_pdf(args, plik, signer, name):
     seal = _wants_seal(args)
     if args.nad:
         pl = _place(plik, args.nad, args.strona, STAMP_W_SEAL if seal else STAMP_W)
@@ -458,38 +571,13 @@ def _sign_one_pdf(args, plik, session, pin):
         page, rect = args.strona, args.rect
     else:
         raise Blad("brak_miejsca", "Podaj --nad TEKST albo --strona N --rect x1 y1 x2 y2.")
-    out = args.out or re.sub(r"\.pdf$", "", plik, flags=re.I) + "-podpisany.pdf"
-    der, cid = _cert_der(session)
-    info = _cert_info(der)
-    # the QSCD key needs a context-specific login before every signature
-    signer = PKCS11Signer(session, cert_id=cid, key_id=cid, base_sign_kwargs={"pin": pin})
-    x1, y1, x2, y2 = [int(round(v)) for v in rect]
-    art = os.path.join(tempfile.mkdtemp(prefix="podpis-"), "pieczec.pdf")
-    _stamp_pdf(art, datetime.now().strftime("%d.%m.%Y, %H:%M"), x2 - x1, y2 - y1, seal, info["imie_nazwisko"])
-    stamp = StaticStampStyle.from_pdf_file(
-        art, border_width=0,
-        background_layout=SimpleBoxLayoutRule(
-            x_align=AxisAlignment.ALIGN_MID, y_align=AxisAlignment.ALIGN_MID,
-            margins=Margins(0, 0, 0, 0), inner_content_scaling=InnerScaling.STRETCH_FILL))
-    field = f"Podpis_{info['imie_nazwisko'].replace(' ', '_')}_{datetime.now():%Y%m%d%H%M%S}"
-    meta = signers.PdfSignatureMetadata(
-        field_name=field, md_algorithm="sha256", subfilter=fields.SigSeedSubFilter.PADES,
-        name=info["imie_nazwisko"],
-        cades_signed_attr_spec=CAdESSignedAttrSpec(commitment_type=GenericCommitment.PROOF_OF_APPROVAL.asn1),
-    )
-    with open(plik, "rb") as inf:
-        w = IncrementalPdfFileWriter(inf, strict=False)
-        fields.append_signature_field(w, fields.SigFieldSpec(sig_field_name=field, on_page=page - 1,
-                                                             box=(x1, y1, x2, y2)))
-        tmp = out + ".tmp"
-        with open(tmp, "wb") as outf:
-            signers.PdfSigner(meta, signer=signer, stamp_style=stamp).sign_pdf(w, output=outf)
-    os.replace(tmp, out)
+    out = args.out or re.sub(r"\.pdf$", "", plik, flags=re.I) + PODPISANY_SUFFIX + ".pdf"
+    _sign_pdf(plik, out, signer, name, page, rect, seal)
     orig = open(plik, "rb").read()
     signed = open(out, "rb").read()
     return {"ok": True, "plik": out, "strona": page, "rect": rect,
             "oryginal_jest_prefiksem": signed.startswith(orig),
-            "podpisal": info["imie_nazwisko"], "sha256": hashlib.sha256(signed).hexdigest()}
+            "podpisal": name, "sha256": hashlib.sha256(signed).hexdigest()}
 
 
 # ---------------------------------------------------------------- XML (XAdES)
@@ -659,11 +747,13 @@ def cmd_sprawdz(args):
 
 def cmd_status(args):
     tok = _token()
-    flags = _pin_flags(tok)
+    mszafir = _is_cloudsigner(_driver())
+    # mSzafir has no PIN on this side: no tries to run out of (Podpis.app reads these flags)
+    flags = {"ostatnia_proba": False, "malo_prob": False} if mszafir else _pin_flags(tok)
     with tok.open() as s:
         der, _ = _cert_der(s)
-    return {"ok": True, "token": tok.label, "numer_karty": tok.serial.decode(errors="replace"),
-            "pin": flags, "certyfikat": _cert_info(der)}
+    return {"ok": True, "sterownik": "mszafir" if mszafir else "karta", "token": tok.label,
+            "numer_karty": tok.serial.decode(errors="replace"), "pin": flags, "certyfikat": _cert_info(der)}
 
 
 def cmd_grafika(args):
@@ -1213,21 +1303,85 @@ def _wyglad_one(plik, nad, when, args):
             "sha256": hashlib.sha256(result).hexdigest()}
 
 
+def _wyglad_podpisz_one(plik, nad, when, args, signer, name):
+    """The art, then the token's invisible signature over it, which covers the art too. Only the
+    signed file is written (name-podpisany.pdf); with no signature line it is signed without art."""
+    import pkcs11
+    base = os.path.basename(plik)
+    if args.out_dir:
+        out = os.path.join(args.out_dir, base)
+    else:
+        out = os.path.join(os.path.dirname(os.path.abspath(plik)),
+                           re.sub(r"\.pdf$", "", base, flags=re.I) + PODPISANY_SUFFIX + ".pdf")
+    if os.path.abspath(out) == os.path.abspath(plik):
+        raise Blad("nadpisanie", "Wynik trafiłby na oryginał. Wskaż inny --out-dir.")
+    with tempfile.TemporaryDirectory() as td:
+        art_dir = os.path.join(td, "grafika")   # its own folder: the file keeps its name there
+        os.mkdir(art_dir)
+        try:
+            res = _wyglad_one(plik, nad, when, argparse.Namespace(**{**vars(args), "out_dir": art_dir}))
+        except Blad as e:
+            if e.kod != "brak_linii":
+                raise
+            with open(plik, "rb") as f:
+                if not f.read(5).startswith(b"%PDF"):
+                    raise Blad("nie_pdf", "To nie jest PDF.")
+            res = {"zrodlo": plik, "plik": plik, "cofniety": None, "miejsca": [], "pominiete": [],
+                   "uwagi": [f"{e.tekst} Podpisałem bez grafiki."]}
+        signed_path = os.path.join(td, "podpisany.pdf")
+        try:
+            _sign_pdf(res["plik"], signed_path, signer, name)
+        except pkcs11.exceptions.PKCS11Error as e:
+            raise Blad("podpis", f"Podpis się nie udał ({type(e).__name__}): odrzucony albo niezatwierdzony "
+                                 "na telefonie, albo CloudSigner przerwał. Nic nie zapisałem.")
+        with open(res["plik"], "rb") as f:
+            before = f.read()
+        with open(signed_path, "rb") as f:
+            signed = f.read()
+    # the proof, before anything is written: the art stays a byte prefix and the new signature covers it all
+    if not signed.startswith(before):
+        raise Blad("kontrola", "Podpisany plik nie zaczyna się od pliku z grafiką; nic nie zapisałem.")
+    podpisy = _check_signatures(signed)
+    if not podpisy or not podpisy[-1]["integralnosc"] or podpisy[-1]["obejmuje"] != "ENTIRE_FILE":
+        raise Blad("kontrola", "Nowy podpis nie jest nienaruszony albo nie obejmuje całego pliku; nic nie zapisałem.")
+    tmp = out + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(signed)
+        os.replace(tmp, out)
+    except OSError as e:
+        raise Blad("zapis", f"Nie mogę zapisać {out}: {e.strerror}. Wskaż --out-dir.")
+    return {**res, "ok": True, "zrodlo": plik, "plik": out, "podpisal": name, "podpisy": podpisy,
+            "uwagi": [u for u in res["uwagi"] if "podpisz plik ponownie" not in u],
+            "sha256": hashlib.sha256(signed).hexdigest()}
+
+
 def cmd_wyglad(args):
-    """The art of your signature on your signature lines, before you sign with another tool."""
+    """The art of your signature on your signature lines, before you sign with another tool,
+    or with --podpisz signed right away with the token (the mSzafir flow)."""
     nad = args.nad or _config().get("imie")
     if not nad:
         raise Blad("brak_nazwiska", "Podaj --nad 'Imię Nazwisko' albo ustaw \"imie\" w config.json.")
     if args.out_dir and not os.path.isdir(args.out_dir):
         raise Blad("out_dir", f"Nie ma folderu {args.out_dir}.")
     when = args.data or datetime.now().strftime("%d.%m.%Y")
+    session = signer = name = None
+    if args.podpisz:
+        session, pin = _open_signing_session(args)   # no token, nothing written
     wyniki = []
-    for plik in args.plik:
-        try:
-            wyniki.append(_wyglad_one(plik, nad, when, args))
-        except Blad as e:
-            wyniki.append({"ok": False, "zrodlo": plik, "kod": e.kod, "blad": e.tekst})
-    return {"ok": all(w["ok"] for w in wyniki), "nad": nad, "pliki": wyniki}
+    try:
+        if session:
+            signer, name = _signer(session, pin)
+        for plik in args.plik:
+            try:
+                wyniki.append(_wyglad_podpisz_one(plik, nad, when, args, signer, name) if signer
+                              else _wyglad_one(plik, nad, when, args))
+            except Blad as e:
+                wyniki.append({"ok": False, "zrodlo": plik, "kod": e.kod, "blad": e.tekst})
+    finally:
+        if session:
+            _close(session)
+    return {"ok": all(w["ok"] for w in wyniki), "nad": nad, "podpisane": bool(signer), "pliki": wyniki}
 
 
 def main():
@@ -1237,9 +1391,10 @@ def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--czekaj", type=int, default=0, help="czekaj do N s na czytnik i kartę")
-    sign = argparse.ArgumentParser(add_help=False)
-    sign.add_argument("--pin-stdin", action="store_true")
-    sign.add_argument("--wymus", action="store_true", help="pozwól na ostatnią próbę PIN-u")
+    auth = argparse.ArgumentParser(add_help=False)
+    auth.add_argument("--pin-stdin", action="store_true")
+    auth.add_argument("--wymus", action="store_true", help="pozwól na ostatnią próbę PIN-u")
+    sign = argparse.ArgumentParser(add_help=False, parents=[auth])
     sign.add_argument("--out")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", parents=[common])
@@ -1260,7 +1415,7 @@ def main():
     pg.add_argument("--pieczec", choices=["tak", "nie"], default="nie")
     ps = sub.add_parser("sprawdz", parents=[common])
     ps.add_argument("plik")
-    pw = sub.add_parser("wyglad", parents=[common])
+    pw = sub.add_parser("wyglad", parents=[common, auth])
     pw.add_argument("plik", nargs="+")
     pw.add_argument("--nad", help="imię i nazwisko pod linią podpisu (domyślnie \"imie\" z config.json)")
     pw.add_argument("--out-dir", help="folder na wyniki (domyślnie obok oryginału, z dopiskiem -do-podpisu)")
@@ -1268,9 +1423,12 @@ def main():
     pw.add_argument("--bez-cofania", action="store_true",
                     help="nie odcinaj ostatniego podpisu, nawet gdy złożyła go osoba z --nad")
     pw.add_argument("--data", help="data w podpisie nad grafiką (domyślnie dziś, DD.MM.RRRR)")
+    pw.add_argument("--podpisz", action="store_true",
+                    help="od razu podpisz kartą albo mSzafirem, niewidocznie, pod grafiką "
+                         "(wynik: nazwa-podpisany.pdf, bez pliku -do-podpisu)")
     a = p.parse_args()
     try:
-        if getattr(a, "czekaj", 0) and a.cmd in ("status", "pdf", "xml"):
+        if getattr(a, "czekaj", 0) and (a.cmd in ("status", "pdf", "xml") or getattr(a, "podpisz", False)):
             _wait_for_card(a.czekaj)
         res = {"status": cmd_status, "miejsce": cmd_miejsce, "pdf": cmd_pdf, "grafika": cmd_grafika,
                "xml": cmd_xml, "sprawdz": cmd_sprawdz, "wyglad": cmd_wyglad}[a.cmd](a)

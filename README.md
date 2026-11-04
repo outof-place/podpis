@@ -8,6 +8,8 @@ Drop a document in, Podpis finds your name on the signature line and puts your s
 
 Podpis is a small macOS app and the `podpisz` command line tool underneath it. It was built for the Szafir card from KIR, whose official app, Szafir2, is an Intel build on Java 15. On Apple silicon that means Rosetta 2, and macOS 27 is the last release where Rosetta works for general apps.
 
+It also works with mSzafir, KIR's mobile qualified signature, with no card and no reader. The signature goes through the driver of KIR's CloudSigner, and you approve it in the mSzafir app on your phone.
+
 ## What it does
 
 - **PDF (PAdES baseline B).** A visible signature on the page, placed on the line above your name. Drag it, double click to move it, Option and the arrow keys nudge it by a point. Rotated pages work. The original file stays byte for byte inside the signed one (incremental update), so earlier signatures stay valid and yours is added after them.
@@ -17,6 +19,7 @@ Podpis is a small macOS app and the `podpisz` command line tool underneath it. I
 - **Touch ID.** Optional. The PIN goes to your Keychain only after a signature succeeds, and Touch ID is skipped when the card is on its last PIN try.
 - **Your look.** Your handwritten signature from a PNG, or your name from the certificate set in a script font. Under it a small line: "Kwalifikowany podpis elektroniczny" and the time.
 - **The look for a signature made with another tool.** `podpisz wyglad` and the Wstaw podpis app put the same look on your signature lines before you sign the file with a tool that signs invisibly. No card, no PIN.
+- **mSzafir.** KIR's mobile qualified signature through CloudSigner, with no PIN on the Mac. `podpisz wyglad --podpisz` and the Wstaw podpis app put the look on your signature lines and sign the file right away. You only approve the signature on your phone.
 
 ## What it does not do
 
@@ -27,7 +30,7 @@ Podpis is a small macOS app and the `podpisz` command line tool underneath it. I
 ## Requirements
 
 - macOS 26 or newer. Tested on macOS 27.0.1, Apple silicon.
-- **Szafir2 from KIR installed.** Podpis does not ship the card driver. It uses `libPKCS11Graphite.dylib` (CryptoTech), a universal binary that comes inside `Szafir2.app`. You keep Szafir2 installed only for that file.
+- **Szafir2 from KIR (card) or CloudSigner from KIR (mSzafir).** Podpis ships no drivers. For the card it uses `libPKCS11Graphite.dylib` (CryptoTech), a universal binary that comes inside `Szafir2.app`. You keep Szafir2 installed only for that file. For mSzafir it uses `libCloudSignerP11.dylib` from `CloudSigner.app` (the macOS build from elektronicznypodpis.pl, Aplikacje i sterowniki). CloudSigner has to run in the background, and `podpisz` starts it when it does not.
 - Python 3.11 or newer, `brew install poppler libxmlsec1` (`xmlsec1` for XML signatures only).
 - Google Chrome, Chromium, Brave or Edge, used headless to draw the signature art.
 - Xcode 26 to build the app.
@@ -64,6 +67,22 @@ Optional settings go in `~/.local/share/podpis/config.json`. Every key has a def
 
 `pieczec` draws a round company seal next to the signature, but only with `podpisz pdf --pieczec tak`. The seal is decoration: no Polish law requires one, and the qualified signature alone carries the legal effect.
 
+`sterownik` is a path or a short name: `"mszafir"` (CloudSigner) or `"karta"` (Szafir2). Without it, `podpisz` takes the first driver it finds, the card's first. With mSzafir, `token` is needed only when CloudSigner has more than one card.
+
+`"wstaw_podpis": "podpisz"` makes Wstaw podpis.app sign the file right away (see below). By default it only puts the look in.
+
+For mSzafir this is enough:
+
+```json
+{
+  "imie": "Jan Kowalski",
+  "sterownik": "mszafir",
+  "wstaw_podpis": "podpisz"
+}
+```
+
+You add the mSzafir card to CloudSigner once: the CloudSigner icon in the menu bar, Certyfikaty, Dodaj nową kartę do systemu, and the code from the mSzafir app on your phone (Generuj kod). `podpisz status` then shows the card and the certificate.
+
 Environment variables: `PODPIS_HOME` (settings folder), `PODPIS_PKCS11` (driver path), `PODPIS_PRZEGLADARKA` (browser binary), `PODPIS_CLI` (which `podpisz` the app runs).
 
 ## Command line
@@ -79,9 +98,10 @@ podpisz xml jpk-metadane.xml                     # XAdES enveloped, verified wit
 podpisz sprawdz umowa-podpisany.pdf              # integrity and coverage
 podpisz grafika --out podpis.png                 # the signature art alone
 podpisz wyglad umowa.pdf --nad "Jan Kowalski"    # the look, before you sign with another tool
+podpisz wyglad umowa.pdf aneks.pdf --podpisz     # the look, then signed right away, card or mSzafir
 ```
 
-PIN: a native macOS prompt by default, or `--pin-stdin`. It is never written to disk or printed. After a wrong PIN, `podpisz` stops and never tries again. On the last try it refuses to sign without `--wymus`.
+PIN: a native macOS prompt by default, or `--pin-stdin`. It is never written to disk or printed. After a wrong PIN, `podpisz` stops and never tries again. On the last try it refuses to sign without `--wymus`. mSzafir has no PIN: CloudSigner asks for the code from the mSzafir app, and you approve the signature on your phone.
 
 ## The look for a signature made with another tool
 
@@ -96,12 +116,14 @@ podpisz wyglad *.pdf --nad "Jan Kowalski" --out-dir do-podpisu
 - **How it sits.** On the line, like ink, clear of labels ("By:"). It keeps off a seal printed on the line: when there is no room beside it the look gets smaller (down to 60%), and only when that fails too does it lie over the seal at full size. When text sits right above the line, the look goes beside the line, level with a signature already on the page. It is drawn with a Multiply blend, so whatever it lies on shows through, as under ink.
 - **Earlier signatures stay intact.** The look is a locked /Stamp annotation (printed, read-only) in an incremental update: the input file stays byte for byte at the start of the result, and no page content changes. Before writing anything, `wyglad` checks every earlier signature with pyHanko and stops when one is not intact or when something other than the look came after it. In `--json`, `zmiany_po` is the verdict of pyHanko's default policy, which calls any annotation added after a signature OTHER (it has no rules for annotations), and `zmiany_po_wyglad` the same policy with a rule for plain /Stamp annotations: ANNOTATIONS means that only the look came after the signature.
 - **Taking back your own signature.** When the last signature in the file is yours (the certificate's name equals `--nad`) and covers the whole file, `wyglad` cuts it off with its incremental update. What is left is the file byte for byte as it was before that signature; the look goes on top, and you sign again. It never cuts anyone else's signature. `--bez-cofania` turns the cut off: your signature then no longer covers the whole file, and `wyglad` says so.
-- **No card.** `wyglad` never loads the card driver, so it works without Szafir2 and without python-pkcs11. The date above the signature is the day the look went in (`--data` changes it), because the time of the signature is not known yet. Rotated pages are skipped.
-- **Wstaw podpis.app.** `scripts/build-droplet.sh` builds an app in `/Applications` (`~/Applications` when it is not writable), no admin rights. Drop PDFs on it: it runs `podpisz wyglad --json`, shows the result in a notification and reveals the files in Finder.
+- **No card.** Without `--podpisz`, `wyglad` never loads the card driver, so it works without Szafir2 and without python-pkcs11. The date above the signature is the day the look went in (`--data` changes it), because the time of the signature is not known yet. Rotated pages are skipped.
+- **Signed right away (`--podpisz`).** First the look, then an invisible PAdES signature with the card or mSzafir, which covers the look too. Only the signed file is written: next to the original as `umowa-podpisany.pdf`, or under the same name in `--out-dir`. There is no `-do-podpisu` file. The session with the card or mSzafir opens before anything else, so without them nothing is written. Before writing, `wyglad` checks that the new signature is intact and covers the whole file. When a file has no signature line with your name, it is signed without the look, and `uwagi` says so. When you reject the signature on your phone, no file is written.
+- **Wstaw podpis.app.** `scripts/build-droplet.sh` builds an app in `/Applications` (`~/Applications` when it is not writable), no admin rights. Drop PDFs on it: it runs `podpisz wyglad --json`, shows the result in a notification and reveals the files in Finder. With `"wstaw_podpis": "podpisz"` in `config.json` it runs `podpisz wyglad --podpisz --json`: you approve the signature on your phone (or type the card's PIN), and `-podpisany.pdf` files appear next to the originals.
 
 ## How it works
 
 - The CryptoTech PKCS#11 driver from Szafir2 talks to the card through [python-pkcs11](https://github.com/pyauth/python-pkcs11). The RSA signature is computed on the card (a qualified signature creation device), with a context-specific login for every signature.
+- With mSzafir, CloudSigner's PKCS#11 driver (`libCloudSignerP11.dylib`, CryptoTech) talks to CloudSigner's RepoServer on the Mac, and that talks to KIR's mSzafir service. The key sits in KIR's remote qualified signature creation device and signs only after you approve on your phone, so it is still a qualified signature.
 - PDF signatures come from [pyHanko](https://github.com/MatthiasValvekens/pyHanko): PAdES baseline B, SHA-256, commitment type "proof of approval", incremental update.
 - The signature art is HTML printed to PDF by a headless Chromium and used as the appearance stream.
 - The signature line is found with `pdftotext -bbox` and `pdftoppm`: the stamp sits above the anchor text, may cross the rule like ink does, and stops below the nearest text above.
