@@ -1,8 +1,11 @@
 // Draws the app icon at 1024 px: usage `swift scripts/make-icon.swift out.png`.
+// With --wyglad it draws the icon of Wstaw podpis.app: the same paper, an amber seal with a plus.
 import AppKit
 
 let size: CGFloat = 1024
-let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "icon.png"
+let args = CommandLine.arguments.dropFirst()
+let wyglad = args.contains("--wyglad")
+let out = args.first(where: { !$0.hasPrefix("--") }) ?? "icon.png"
 
 func color(_ hex: UInt32, _ a: CGFloat = 1) -> NSColor {
     NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
@@ -88,12 +91,20 @@ ctx.restoreGState()
 let inner = NSBezierPath(ovalIn: CGRect(x: c.x - r + 16, y: c.y - r + 16, width: 2 * r - 32, height: 2 * r - 32))
 ctx.saveGState()
 inner.addClip()
-NSGradient(colors: [color(0x43d17a), color(0x1f9d50)])!.draw(in: inner.bounds, angle: -90)
+NSGradient(colors: wyglad ? [color(0xf6b44c), color(0xdc7a10)] : [color(0x43d17a), color(0x1f9d50)])!
+    .draw(in: inner.bounds, angle: -90)
 ctx.restoreGState()
 let check = NSBezierPath()
-check.move(to: CGPoint(x: c.x - 52, y: c.y + 2))
-check.line(to: CGPoint(x: c.x - 14, y: c.y - 38))
-check.line(to: CGPoint(x: c.x + 58, y: c.y + 44))
+if wyglad {   // a plus: the signature goes in
+    check.move(to: CGPoint(x: c.x - 50, y: c.y))
+    check.line(to: CGPoint(x: c.x + 50, y: c.y))
+    check.move(to: CGPoint(x: c.x, y: c.y - 50))
+    check.line(to: CGPoint(x: c.x, y: c.y + 50))
+} else {
+    check.move(to: CGPoint(x: c.x - 52, y: c.y + 2))
+    check.line(to: CGPoint(x: c.x - 14, y: c.y - 38))
+    check.line(to: CGPoint(x: c.x + 58, y: c.y + 44))
+}
 check.lineWidth = 30
 check.lineCapStyle = .round
 check.lineJoinStyle = .round
